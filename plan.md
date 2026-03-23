@@ -3,6 +3,8 @@
 ## Finished
 * Created CLAUDE.md at project root (/Users/Sophie/ObsidianVault/AI-Infra-Study/CLAUDE.md) with an instruction to auto-read plan.md at the start of every conversation.
 * Connected GKE MCP server (`gke-mcp` v0.10.0) to Claude Code. Binary at `/Users/Sophie/go/bin/gke-mcp`. Authenticated via `gcloud auth application-default login`.
+* Initialized git repository for `ai_infra_projects/` folder with `plan.md` as the initial commit on branch `master`.
+* Updated CLAUDE.md with plan.md read/write instructions: summarize top 3 date entries on session start, log completed tasks under today's Finished section.
 # 2026-03-21
 
 ## Finished
