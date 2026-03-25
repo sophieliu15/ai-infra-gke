@@ -1,1 +1,11 @@
 plan.md
+
+# Credentials and secrets
+*.json
+*.key
+*.pem
+*.p12
+.env
+.env.*
+*-credentials.yaml
+*-secret.yaml
