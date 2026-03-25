@@ -1,6 +1,6 @@
-# KServe Study Environment
+# KServe on GKE
 
-GKE cluster + KServe install scripts for Week 1-4 hands-on projects.
+Automated setup for running KServe on Google Kubernetes Engine, covering model serving, REST inference, and canary deployments.
 
 ## Session Workflow
 
@@ -39,15 +39,6 @@ bash cluster.sh delete
 | KServe version | v0.17.0 |
 | Deployment mode | Standard (warm pods, no Knative sidecars) |
 | Ingress | Gateway API |
-
-## Week-by-Week Usage
-
-| Week | What you do | Scripts needed |
-|---|---|---|
-| Week 1 | Install KServe, verify pods running | `cluster.sh create` + `install.sh` |
-| Week 2 | Deploy DistilBERT InferenceService, send curl request | same |
-| Week 3 | Canary deployments via Gateway API | same |
-| Week 4 | Promote/rollback canary | same |
 
 ## Troubleshooting Log
 
