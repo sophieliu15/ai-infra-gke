@@ -40,7 +40,7 @@ kubectl patch configmap/inferenceservice-config -n kserve --type=strategic \
   -p '{"data": {"deploy": "{\"defaultDeploymentMode\": \"Standard\"}"}}'
 
 kubectl patch configmap/inferenceservice-config -n kserve --type=strategic \
-  -p '{"data": {"ingress": "{\"enableGatewayApi\": true, \"kserveIngressGateway\": \"kserve/kserve-ingress-gateway\"}"}}'
+  -p '{"data": {"ingress": "{\"ingressGateway\": \"kserve/kserve-ingress-gateway\", \"enableGatewayApi\": true, \"kserveIngressGateway\": \"kserve/kserve-ingress-gateway\", \"disableIstioVirtualHost\": true}"}}'
 
 echo ""
 echo "==> KServe install complete. Verifying..."
