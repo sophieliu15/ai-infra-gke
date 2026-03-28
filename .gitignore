@@ -1,4 +1,6 @@
-plan.md
+# KServe analysis/drafts (keep README.md tracked)
+kserve/*.md
+!kserve/README.md
 
 # Credentials and secrets
 *.json

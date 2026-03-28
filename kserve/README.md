@@ -128,12 +128,46 @@ The model is `distilbert-base-uncased-finetuned-sst-2-english` — DistilBERT fi
 
 **Fix:** Use `--task=sequence_classification` (not `text-classification`) in the InferenceService args.
 
-### 8. GKE Gateway rejects KServe HTTPRoutes with timeouts (open)
+### 8. GKE Gateway rejects KServe HTTPRoutes with timeouts (fixed)
 
-**Problem:** KServe sets `timeouts: request: 60s` on all generated HTTPRoutes. GKE's Gateway controller does not support the `timeouts` field.
+**Problem:** KServe v0.17.0 hardcodes `timeouts: {request: 60s}` on every HTTPRoute it creates (`httproute_reconciler.go`). GKE's Gateway controller does not implement `spec.rules.timeouts`, so it rejects the route with `Accepted: False` / `UnsupportedValue`. There is no existing config flag to disable this, and manually patching the HTTPRoute is reverted by the reconciler loop.
 
-**Symptom:** Gateway stays `PROGRAMMED: False` with event: `HTTPRoute "default/distilbert-sst2" is misconfigured, err: Timeouts are not supported.`
+**Symptom:** HTTPRoute `Accepted: False` with reason `UnsupportedValue`. InferenceService stays `IngressReady: False`. No external URL is assigned.
 
-**Status:** Open — blocks external URL from being assigned. Inference works via `kubectl port-forward` in the meantime. Must be resolved before Week 3 canary deployments.
+**Root cause analysis:** [httproute-timeout-analysis.md](httproute-timeout-analysis.md)
 
-**Potential fix:** Investigate KServe config option to suppress timeout generation on HTTPRoutes, or use Istio as the gateway implementation.
+**Fix:** We implemented a `DisableHTTPRouteTimeout` config flag in a fork of KServe. When set to `true` in the `inferenceservice-config` ConfigMap, the controller omits the `Timeouts` field from HTTPRoutes entirely. Default behavior is unchanged.
+
+- **Upstream PR:** https://github.com/kserve/kserve/pull/5313
+- **Upstream issue:** https://github.com/kserve/kserve/issues/5311
+- **Test report:** [disable-httproute-timeout-test-report.md](disable-httproute-timeout-test-report.md)
+- **Fork:** https://github.com/sophieliu15/kserve (branch: `fix/disable-httproute-timeout`)
+
+**Until the PR is merged**, use the custom controller image or one of these workarounds:
+1. Scale the controller to 0, then patch the HTTPRoute to remove timeouts (static testing only).
+2. Install Kyverno with a mutating policy to strip the field (see analysis doc).
+
+**Config (with custom controller):**
+```json
+{
+  "enableGatewayApi": true,
+  "kserveIngressGateway": "kserve/kserve-ingress-gateway",
+  "disableHTTPRouteTimeout": true
+}
+```
+
+### 9. GKE Gateway rejects KServe HTTPRoute regex path (open)
+
+**Problem:** KServe uses `RegularExpression` path match type with pattern `^/.*$` on HTTPRoutes. GKE Gateway validates that even regex paths must start with `/` and rejects this pattern.
+
+**Symptom:** HTTPRoute `Accepted: False` with `GWCER104: Paths must start with a '/' character "^/.*$"`.
+
+**Workaround:** Scale the controller to 0, then patch the HTTPRoute path to `PathPrefix: /`:
+```bash
+kubectl scale deploy kserve-controller-manager -n kserve --replicas=0
+kubectl patch httproute <name> --type=json \
+  -p='[{"op":"replace","path":"/spec/rules/0/matches/0/path/type","value":"PathPrefix"},
+       {"op":"replace","path":"/spec/rules/0/matches/0/path/value","value":"/"}]'
+```
+
+**Status:** Open — needs a separate fix in the KServe fork. Same reconciler-fight pattern as the timeout issue.
