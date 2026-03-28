@@ -1,6 +1,8 @@
-# KServe analysis/drafts (keep README.md tracked)
+# KServe analysis/drafts (keep README.md and referenced docs tracked)
 kserve/*.md
 !kserve/README.md
+!kserve/httproute-timeout-analysis.md
+!kserve/disable-httproute-timeout-test-report.md
 
 # Credentials and secrets
 *.json
