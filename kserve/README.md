@@ -64,6 +64,33 @@ curl -s http://localhost:8080/v1/models/distilbert-sst2:predict \
 
 The model is `distilbert-base-uncased-finetuned-sst-2-english` — DistilBERT fine-tuned on the Stanford Sentiment Treebank (SST-2) binary classification dataset.
 
+### Via GKE Gateway (external ingress)
+
+Once the Gateway is programmed and the HTTPRoute is `Accepted`, you can reach the model through the external IP:
+
+```bash
+# Get the Gateway external IP
+GATEWAY_IP=$(kubectl get gateway kserve-ingress-gateway -n kserve \
+  -o jsonpath='{.status.addresses[0].value}')
+
+# Get the model's hostname from the InferenceService status
+MODEL_HOST=$(kubectl get inferenceservice distilbert-sst2 -n default \
+  -o jsonpath='{.status.url}' | sed 's|https\?://||')
+
+# Send a prediction request through the Gateway
+curl -s http://${GATEWAY_IP}/v1/models/distilbert-sst2:predict \
+  -H "Host: ${MODEL_HOST}" \
+  -H 'Content-Type: application/json' \
+  -d '{"instances": ["This movie was absolutely fantastic", "What a terrible waste of time"]}'
+```
+
+The `Host` header is required because KServe uses host-based routing — the Gateway matches the hostname to decide which HTTPRoute (and therefore which backend service) to forward to.
+
+**Prerequisites:**
+- Gateway resource `kserve-ingress-gateway` exists in the `kserve` namespace (created by `install.sh`)
+- `inferenceservice-config` has `enableGatewayApi: true` and `disableHTTPRouteTimeout: true` (see troubleshooting #8)
+- HTTPRoute path match fix applied (see troubleshooting #9) — either via custom controller image or manual patch
+
 ## Troubleshooting Log
 
 ### 1. GKE Gateway API CRD conflict with KServe
