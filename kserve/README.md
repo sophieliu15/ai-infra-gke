@@ -156,18 +156,25 @@ The model is `distilbert-base-uncased-finetuned-sst-2-english` — DistilBERT fi
 }
 ```
 
-### 9. GKE Gateway rejects KServe HTTPRoute regex path (open)
+### 9. GKE Gateway rejects KServe HTTPRoute regex path (in progress)
 
-**Problem:** KServe uses `RegularExpression` path match type with pattern `^/.*$` on HTTPRoutes. GKE Gateway validates that even regex paths must start with `/` and rejects this pattern.
+**Problem:** KServe uses `RegularExpression` path match type with pattern `^/.*$` on HTTPRoutes. GKE Gateway does not support `RegularExpression` (it is "Extended" conformance in the Gateway API spec) and rejects the route.
 
 **Symptom:** HTTPRoute `Accepted: False` with `GWCER104: Paths must start with a '/' character "^/.*$"`.
 
-**Workaround:** Scale the controller to 0, then patch the HTTPRoute path to `PathPrefix: /`:
+**Root cause:** `createHTTPRouteMatch()` in `httproute_reconciler.go` hardcodes `PathMatchRegularExpression`. Called 9 times across the reconciler. The dominant pattern `^/.*$` (FallbackPrefix, 6 of 9 sites) is functionally equivalent to `PathPrefix: /`.
+
+**Root cause analysis:** [httproute-regex-path-analysis.md](httproute-regex-path-analysis.md)
+
+**Planned fix:** Add a `pathMatchType` config flag to `inferenceservice-config` (Option A from analysis). When set to `"PathPrefix"`, the reconciler uses `PathMatchPathPrefix` with equivalent prefix paths. Same pattern as the timeout fix (#8).
+
+- **Upstream issue:** https://github.com/kserve/kserve/issues/5319
+- **Fork:** https://github.com/sophieliu15/kserve (implementation pending)
+
+**Workaround (until fix is implemented):** Scale the controller to 0, then patch the HTTPRoute path to `PathPrefix: /`:
 ```bash
 kubectl scale deploy kserve-controller-manager -n kserve --replicas=0
 kubectl patch httproute <name> --type=json \
   -p='[{"op":"replace","path":"/spec/rules/0/matches/0/path/type","value":"PathPrefix"},
        {"op":"replace","path":"/spec/rules/0/matches/0/path/value","value":"/"}]'
 ```
-
-**Status:** Open — needs a separate fix in the KServe fork. Same reconciler-fight pattern as the timeout issue.
