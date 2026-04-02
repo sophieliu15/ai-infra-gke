@@ -40,6 +40,22 @@ bash cluster.sh delete
 | Deployment mode | Standard (warm pods, no Knative sidecars) |
 | Ingress | Gateway API |
 
+## Why Standard Mode + Gateway API (not Knative)
+
+KServe supports two deployment modes. We chose **Standard Mode with Gateway API** over the default Knative/serverless mode for several reasons:
+
+| Concern                      | Knative (Serverless)                                                                            | Standard + Gateway API                                                  | Why it matters for LLMs                                                                                                                                    |
+| ---------------------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Cold starts**              | Scales to zero — first request waits for pod startup + model load (seconds to minutes for LLMs) | Pods stay warm, no cold-start latency                                   | LLMs are multi-GB; loading into GPU memory takes 30s–5min. Unacceptable for user-facing inference.                                                         |
+| **Sidecar overhead**         | Requires Istio sidecar injection — adds memory/CPU per pod, complicates networking              | No sidecars needed                                                      | GPU nodes are expensive — sidecar memory overhead competes with model memory.                                                                              |
+| **Long-running connections** | Designed for request/response; streaming and long inference calls can hit Knative timeouts      | Native support for long-lived connections (important for LLM streaming) | LLM token streaming (SSE/WebSocket) requires persistent connections that outlast Knative's request timeout model.                                          |
+| **Operational complexity**   | Must install and manage Knative Serving + Istio (or Kourier) + KServe                           | Just KServe + cert-manager — fewer moving parts                         | Fewer components to debug when GPU scheduling or model loading fails.                                                                                      |
+| **GPU resource efficiency**  | Scale-to-zero means losing expensive GPU allocation; scale-up means re-loading multi-GB models  | Persistent pods keep models in GPU memory                               | A single A100 costs ~$2/hr — reloading a 70B model on every scale-up wastes both time and money. Keeping the pod warm is cheaper than repeated cold loads. |
+
+**Tradeoff:** Knative mode has better built-in canary support (`canaryTrafficPercent` field works natively). In Standard Mode, canary rollouts require manual HTTPRoute `backendRefs` weight management or external tools (Argo Rollouts, Flagger). This is a known gap in KServe's Standard Mode feature parity.
+
+**Bottom line:** For LLM and large model serving on GKE, Standard Mode + Gateway API is the recommended path. The cold-start and sidecar penalties of Knative outweigh its convenience features for production inference workloads.
+
 ## Sending an Inference Request
 
 Once the model pod is Running, use port-forward to reach it directly (works even if the Gateway is not yet programmed):
