@@ -62,10 +62,10 @@ Once the model pod is Running, use port-forward to reach it directly (works even
 
 ```bash
 # Forward the predictor service to localhost
-kubectl port-forward svc/distilbert-sst2-predictor -n default 8080:80 &
+kubectl port-forward svc/distilbert-v1-predictor -n default 8080:80 &
 
 # Send a prediction request (KServe v1 predict API)
-curl -s http://localhost:8080/v1/models/distilbert-sst2:predict \
+curl -s http://localhost:8080/v1/models/distilbert-v1:predict \
   -H 'Content-Type: application/json' \
   -d '{"instances": ["This movie was absolutely fantastic", "What a terrible waste of time"]}'
 ```
@@ -90,11 +90,11 @@ GATEWAY_IP=$(kubectl get gateway kserve-ingress-gateway -n kserve \
   -o jsonpath='{.status.addresses[0].value}')
 
 # Get the model's hostname from the InferenceService status
-MODEL_HOST=$(kubectl get inferenceservice distilbert-sst2 -n default \
+MODEL_HOST=$(kubectl get inferenceservice distilbert-v1 -n default \
   -o jsonpath='{.status.url}' | sed 's|https\?://||')
 
 # Send a prediction request through the Gateway
-curl -s http://${GATEWAY_IP}/v1/models/distilbert-sst2:predict \
+curl -s http://${GATEWAY_IP}/v1/models/distilbert-v1:predict \
   -H "Host: ${MODEL_HOST}" \
   -H 'Content-Type: application/json' \
   -d '{"instances": ["This movie was absolutely fantastic", "What a terrible waste of time"]}'
