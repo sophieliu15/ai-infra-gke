@@ -33,14 +33,22 @@ echo "==> Waiting for KServe controller and webhooks to be ready..."
 kubectl wait --for=condition=Available deployment --all -n kserve --timeout=180s
 
 echo "==> Applying KServe cluster resources (serving runtimes)..."
-kubectl apply --server-side -f "https://github.com/kserve/kserve/releases/download/${KSERVE_VERSION}/kserve-cluster-resources.yaml"
+# CRDs from kserve.yaml (e.g. ClusterStorageContainer) may not be indexed yet.
+# Retry up to 3 times with a short wait for the API server to catch up.
+for i in 1 2 3; do
+  kubectl apply --server-side \
+    -f "https://github.com/kserve/kserve/releases/download/${KSERVE_VERSION}/kserve-cluster-resources.yaml" \
+    && break
+  echo "    Attempt $i failed — waiting 10s for CRDs to propagate..."
+  sleep 10
+done
 
 echo "==> Configuring Standard Mode + Gateway API..."
 kubectl patch configmap/inferenceservice-config -n kserve --type=strategic \
   -p '{"data": {"deploy": "{\"defaultDeploymentMode\": \"Standard\"}"}}'
 
 kubectl patch configmap/inferenceservice-config -n kserve --type=strategic \
-  -p '{"data": {"ingress": "{\"ingressGateway\": \"kserve/kserve-ingress-gateway\", \"enableGatewayApi\": true, \"kserveIngressGateway\": \"kserve/kserve-ingress-gateway\", \"disableIstioVirtualHost\": true}"}}'
+  -p '{"data": {"ingress": "{\"ingressGateway\": \"kserve/kserve-ingress-gateway\", \"enableGatewayApi\": true, \"kserveIngressGateway\": \"kserve/kserve-ingress-gateway\", \"disableIstioVirtualHost\": true, \"disableHTTPRouteTimeout\": true}"}}'
 
 echo ""
 echo "==> KServe install complete. Verifying..."
