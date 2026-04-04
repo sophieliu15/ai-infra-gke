@@ -1,0 +1,84 @@
+# Standalone canary Deployment + Service for weight-based traffic splitting.
+# Uses the same --model_name as the stable v1 ISVC so that both backends
+# respond to the same inference URL path (model name parity).
+# See canary-traffic-split-troubleshooting.md for details.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: canary-v2-predictor
+  namespace: default
+  labels:
+    app: canary-v2-predictor
+    version: v2
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: canary-v2-predictor
+  template:
+    metadata:
+      labels:
+        app: canary-v2-predictor
+        version: v2
+    spec:
+      initContainers:
+      - name: storage-initializer
+        image: kserve/storage-initializer:v0.17.0
+        args:
+          - "hf://distilbert/distilbert-base-uncased-finetuned-sst-2-english"
+          - "/mnt/models"
+        env:
+        - name: HF_HUB_ENABLE_HF_TRANSFER
+          value: "1"
+        resources:
+          limits:
+            cpu: "1"
+            memory: 1Gi
+          requests:
+            cpu: 100m
+            memory: 100Mi
+        volumeMounts:
+        - name: model-volume
+          mountPath: /mnt/models
+      containers:
+      - name: kserve-container
+        image: kserve/huggingfaceserver:v0.17.0
+        args:
+          - "--model_name=distilbert-v1"
+          - "--task=sequence_classification"
+        resources:
+          requests:
+            cpu: "1"
+            memory: 2Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+        readinessProbe:
+          tcpSocket:
+            port: 8080
+          periodSeconds: 10
+        volumeMounts:
+        - name: model-volume
+          mountPath: /mnt/models
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          capabilities:
+            drop: ["ALL"]
+      volumes:
+      - name: model-volume
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: canary-v2-predictor
+  namespace: default
+spec:
+  selector:
+    app: canary-v2-predictor
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP

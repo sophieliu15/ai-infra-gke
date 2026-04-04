@@ -1,7 +1,7 @@
 apiVersion: serving.kserve.io/v1beta1
 kind: InferenceService
 metadata:
-  name: distilbert-sst2
+  name: distilbert-v1
   namespace: default
 spec:
   predictor:
