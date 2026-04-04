@@ -4,6 +4,7 @@ kserve/*.md
 !kserve/httproute-timeout-analysis.md
 !kserve/disable-httproute-timeout-test-report.md
 !kserve/httproute-regex-path-analysis.md
+!kserve/canary-traffic-split-troubleshooting.md
 
 # Credentials and secrets
 *.json
