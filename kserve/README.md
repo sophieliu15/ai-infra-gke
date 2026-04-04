@@ -235,6 +235,13 @@ kubectl patch httproute distilbert-canary -n default --type=json \
        {"op":"replace","path":"/spec/rules/0/backendRefs/1/weight","value":50}]'
 ```
 
+### Common Mistakes to Avoid
+
+- Scaling controller back to 1 mid-session (it overwrites all manual HTTPRoutes with regex paths)
+- Creating a second ISVC for canary (model name mismatch causes 404s — use standalone Deployment instead)
+- Deploying v2 before fixing v1 routes (one bad regex route poisons the entire gateway)
+- Using dict-style payloads with v1 predict endpoint (see below)
+
 ### Payload Format
 
 Use simple list-style payloads with the v1 predict endpoint:
