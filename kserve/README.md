@@ -35,7 +35,7 @@ bash cluster.sh delete
 | Project | `ai-infra-lab-86222` |
 | Zone | `us-central1-a` |
 | Nodes | 3x `e2-standard-4` (4 vCPU, 16 GB RAM each) |
-| GKE version | 1.34 |
+| GKE version | 1.35 |
 | KServe version | v0.17.0 |
 | Deployment mode | Standard (warm pods, no Knative sidecars) |
 | Ingress | Gateway API |
@@ -106,6 +106,142 @@ The `Host` header is required because KServe uses host-based routing — the Gat
 - Gateway resource `kserve-ingress-gateway` exists in the `kserve` namespace (created by `install.sh`)
 - `inferenceservice-config` has `enableGatewayApi: true` and `disableHTTPRouteTimeout: true` (see troubleshooting #8)
 - HTTPRoute path match fix applied (see troubleshooting #9) — either via custom controller image or manual patch
+
+## Canary Deployments (Weight-Based Traffic Splitting)
+
+KServe Standard Mode does not support `canaryTrafficPercent` — that field only works in Knative/Serverless mode (tracked in [kserve/kserve#5335](https://github.com/kserve/kserve/issues/5335)). On GKE Gateway, canary deployments require manual HTTPRoute weight configuration.
+
+### Key Insight: Model Name Parity
+
+Both the stable and canary backends **must serve the same model name**. KServe's inference protocol includes the model name in the URL path (`/v1/models/<name>:predict`). If the canary has a different model name, requests routed to it return 404. This means you cannot simply create a second InferenceService — instead, create a standalone Deployment+Service with `--model_name` matching the stable version.
+
+Full analysis: [canary-traffic-split-troubleshooting.md](canary-traffic-split-troubleshooting.md)
+
+### Step-by-Step
+
+**Prerequisites:** Cluster running, KServe installed with custom controller image and `disableHTTPRouteTimeout: true` (see troubleshooting #8, #9).
+
+**1. Deploy the stable model (v1)**
+```bash
+kubectl apply -f distilbert-isvc.yaml
+# Wait for pod ready
+kubectl wait --for=condition=Ready pod \
+  -l serving.kserve.io/inferenceservice=distilbert-v1 --timeout=300s
+```
+
+**2. Scale controller to 0 and fix HTTPRoute paths**
+
+The controller creates routes with `RegularExpression` path matches that GKE rejects. Fix them before proceeding:
+```bash
+kubectl scale deploy kserve-controller-manager -n kserve --replicas=0
+
+for route in distilbert-v1 distilbert-v1-predictor; do
+  kubectl patch httproute "$route" -n default --type=json \
+    -p='[{"op":"replace","path":"/spec/rules/0/matches/0/path/type","value":"PathPrefix"},
+         {"op":"replace","path":"/spec/rules/0/matches/0/path/value","value":"/"}]'
+done
+```
+
+**3. Deploy canary v2 as a standalone Deployment+Service**
+
+Scale controller back to 1 briefly (needed for webhook admission), deploy, then scale back to 0:
+```bash
+kubectl scale deploy kserve-controller-manager -n kserve --replicas=1
+kubectl wait --for=condition=Available deploy/kserve-controller-manager -n kserve --timeout=60s
+kubectl apply -f canary-v2-deployment.yaml   # Deployment + Service
+kubectl scale deploy kserve-controller-manager -n kserve --replicas=0
+```
+
+The canary Deployment must include:
+- `--model_name=distilbert-v1` (same as stable — this is critical)
+- A `storage-initializer` init container to download the model
+- Its own Service (`canary-v2-predictor`) targeting port 8080
+
+**4. Fix any new HTTPRoutes and wait for canary pod**
+```bash
+# Fix any routes the controller re-created with regex paths
+for route in $(kubectl get httproute -n default -o name); do
+  kubectl patch "$route" -n default --type=json \
+    -p='[{"op":"replace","path":"/spec/rules/0/matches/0/path/type","value":"PathPrefix"},
+         {"op":"replace","path":"/spec/rules/0/matches/0/path/value","value":"/"}]' 2>/dev/null
+done
+
+kubectl wait --for=condition=Ready pod -l app=canary-v2-predictor --timeout=300s
+```
+
+**5. Warmup canary v2**
+```bash
+kubectl port-forward svc/canary-v2-predictor 8081:80 &
+curl -s http://localhost:8081/v1/models/distilbert-v1:predict \
+  -H 'Content-Type: application/json' \
+  -d '{"instances": ["warmup"]}'
+kill %1
+```
+
+**6. Create canary HTTPRoute with 90/10 split**
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: distilbert-canary
+  namespace: default
+spec:
+  parentRefs:
+  - name: kserve-ingress-gateway
+    namespace: kserve
+  hostnames:
+  - "distilbert-canary-default.example.com"
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: distilbert-v1-predictor
+      port: 80
+      weight: 90
+    - name: canary-v2-predictor
+      port: 80
+      weight: 10
+```
+
+**7. Test the traffic split**
+```bash
+GATEWAY_IP=$(kubectl get gateway kserve-ingress-gateway -n kserve \
+  -o jsonpath='{.status.addresses[0].value}')
+
+# Send requests and verify both backends receive traffic
+for i in $(seq 1 20); do
+  curl -s "http://$GATEWAY_IP/v1/models/distilbert-v1:predict" \
+    -H "Host: distilbert-canary-default.example.com" \
+    -H "Content-Type: application/json" \
+    -d '{"instances": ["This movie is great"]}'
+  echo ""
+done
+
+# Check traffic distribution in pod logs
+kubectl logs -l app=isvc.distilbert-v1-predictor --tail=100 | grep -c "POST /v1"
+kubectl logs -l app=canary-v2-predictor --tail=100 | grep -c "POST /v1"
+```
+
+**Expected result:** ~90% of requests hit v1, ~10% hit canary-v2 (exact distribution varies at low request counts due to GKE load balancer behavior).
+
+### Adjusting the Split
+
+To shift traffic (e.g., promote to 50/50, then 0/100):
+```bash
+kubectl patch httproute distilbert-canary -n default --type=json \
+  -p='[{"op":"replace","path":"/spec/rules/0/backendRefs/0/weight","value":50},
+       {"op":"replace","path":"/spec/rules/0/backendRefs/1/weight","value":50}]'
+```
+
+### Payload Format
+
+Use simple list-style payloads with the v1 predict endpoint:
+```json
+{"instances": ["text1", "text2"]}
+```
+Do **not** use dict-style payloads like `{"instances": [{"text": "hello"}]}` — these fail with a pandas `ValueError`.
 
 ## Troubleshooting Log
 
@@ -186,11 +322,10 @@ The `Host` header is required because KServe uses host-based routing — the Gat
 - **Test report:** [disable-httproute-timeout-test-report.md](disable-httproute-timeout-test-report.md)
 - **Fork:** https://github.com/sophieliu15/kserve (branch: `fix/disable-httproute-timeout`)
 
-**Until the PR is merged**, use the custom controller image or one of these workarounds:
-1. Scale the controller to 0, then patch the HTTPRoute to remove timeouts (static testing only).
-2. Install Kyverno with a mutating policy to strip the field (see analysis doc).
+**Status:** PR merged upstream. Until the next KServe release includes it, use the custom controller image:
+`us-central1-docker.pkg.dev/ai-infra-lab-86222/kserve-dev/kserve-controller:disable-timeout`
 
-**Config (with custom controller):**
+**Config:**
 ```json
 {
   "enableGatewayApi": true,
