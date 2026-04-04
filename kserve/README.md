@@ -119,7 +119,7 @@ Full analysis: [canary-traffic-split-troubleshooting.md](canary-traffic-split-tr
 
 ### Step-by-Step
 
-**Prerequisites:** Cluster running, KServe installed with custom controller image and `disableHTTPRouteTimeout: true` (see troubleshooting #8, #9).
+**Prerequisites:** Cluster running, KServe installed with custom controller image that includes both the timeout and path match fixes, configured with `disableHTTPRouteTimeout: true` and `pathMatchType: "PathPrefix"` (see troubleshooting #8, #9). With these fixes, the controller creates HTTPRoutes that GKE Gateway accepts natively — no manual patching or scaling the controller to 0 is needed.
 
 **1. Deploy the stable model (v1)**
 ```bash
@@ -129,27 +129,9 @@ kubectl wait --for=condition=Ready pod \
   -l serving.kserve.io/inferenceservice=distilbert-v1 --timeout=300s
 ```
 
-**2. Scale controller to 0 and fix HTTPRoute paths**
-
-The controller creates routes with `RegularExpression` path matches that GKE rejects. Fix them before proceeding:
+**2. Deploy canary v2 as a standalone Deployment+Service**
 ```bash
-kubectl scale deploy kserve-controller-manager -n kserve --replicas=0
-
-for route in distilbert-v1 distilbert-v1-predictor; do
-  kubectl patch httproute "$route" -n default --type=json \
-    -p='[{"op":"replace","path":"/spec/rules/0/matches/0/path/type","value":"PathPrefix"},
-         {"op":"replace","path":"/spec/rules/0/matches/0/path/value","value":"/"}]'
-done
-```
-
-**3. Deploy canary v2 as a standalone Deployment+Service**
-
-Scale controller back to 1 briefly (needed for webhook admission), deploy, then scale back to 0:
-```bash
-kubectl scale deploy kserve-controller-manager -n kserve --replicas=1
-kubectl wait --for=condition=Available deploy/kserve-controller-manager -n kserve --timeout=60s
 kubectl apply -f canary-v2-deployment.yaml   # Deployment + Service
-kubectl scale deploy kserve-controller-manager -n kserve --replicas=0
 ```
 
 The canary Deployment must include:
@@ -157,19 +139,12 @@ The canary Deployment must include:
 - A `storage-initializer` init container to download the model
 - Its own Service (`canary-v2-predictor`) targeting port 8080
 
-**4. Fix any new HTTPRoutes and wait for canary pod**
+**3. Wait for canary pod**
 ```bash
-# Fix any routes the controller re-created with regex paths
-for route in $(kubectl get httproute -n default -o name); do
-  kubectl patch "$route" -n default --type=json \
-    -p='[{"op":"replace","path":"/spec/rules/0/matches/0/path/type","value":"PathPrefix"},
-         {"op":"replace","path":"/spec/rules/0/matches/0/path/value","value":"/"}]' 2>/dev/null
-done
-
 kubectl wait --for=condition=Ready pod -l app=canary-v2-predictor --timeout=300s
 ```
 
-**5. Warmup canary v2**
+**4. Warmup canary v2**
 ```bash
 kubectl port-forward svc/canary-v2-predictor 8081:80 &
 curl -s http://localhost:8081/v1/models/distilbert-v1:predict \
@@ -178,7 +153,7 @@ curl -s http://localhost:8081/v1/models/distilbert-v1:predict \
 kill %1
 ```
 
-**6. Create canary HTTPRoute with 90/10 split**
+**5. Create canary HTTPRoute with 90/10 split**
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -205,7 +180,7 @@ spec:
       weight: 10
 ```
 
-**7. Test the traffic split**
+**6. Test the traffic split**
 ```bash
 GATEWAY_IP=$(kubectl get gateway kserve-ingress-gateway -n kserve \
   -o jsonpath='{.status.addresses[0].value}')
@@ -237,9 +212,8 @@ kubectl patch httproute distilbert-canary -n default --type=json \
 
 ### Common Mistakes to Avoid
 
-- Scaling controller back to 1 mid-session (it overwrites all manual HTTPRoutes with regex paths)
 - Creating a second ISVC for canary (model name mismatch causes 404s — use standalone Deployment instead)
-- Deploying v2 before fixing v1 routes (one bad regex route poisons the entire gateway)
+- Not using the custom controller image with `pathMatchType: "PathPrefix"` (stock KServe creates regex paths that GKE rejects)
 - Using dict-style payloads with v1 predict endpoint (see below)
 
 ### Payload Format
@@ -341,7 +315,7 @@ Do **not** use dict-style payloads like `{"instances": [{"text": "hello"}]}` —
 }
 ```
 
-### 9. GKE Gateway rejects KServe HTTPRoute regex path (in progress)
+### 9. GKE Gateway rejects KServe HTTPRoute regex path (fixed)
 
 **Problem:** KServe uses `RegularExpression` path match type with pattern `^/.*$` on HTTPRoutes. GKE Gateway does not support `RegularExpression` (it is "Extended" conformance in the Gateway API spec) and rejects the route.
 
@@ -351,12 +325,28 @@ Do **not** use dict-style payloads like `{"instances": [{"text": "hello"}]}` —
 
 **Root cause analysis:** [httproute-regex-path-analysis.md](httproute-regex-path-analysis.md)
 
-**Planned fix:** Add a `pathMatchType` config flag to `inferenceservice-config` (Option A from analysis). When set to `"PathPrefix"`, the reconciler uses `PathMatchPathPrefix` with equivalent prefix paths. Same pattern as the timeout fix (#8).
+**Fix:** We implemented a `pathMatchType` config flag in a fork of KServe. When set to `"PathPrefix"` in the `inferenceservice-config` ConfigMap, the reconciler uses `PathMatchPathPrefix` with equivalent prefix paths. Same pattern as the timeout fix (#8). Default behavior is unchanged.
 
+- **Upstream PR:** https://github.com/kserve/kserve/pull/5347
 - **Upstream issue:** https://github.com/kserve/kserve/issues/5319
-- **Fork:** https://github.com/sophieliu15/kserve (implementation pending)
+- **Docs PR:** https://github.com/kserve/website/pull/646
+- **Test report:** [path-match-type-test-report.md](path-match-type-test-report.md)
+- **Fork:** https://github.com/sophieliu15/kserve (branch: `fix/path-match-type`)
 
-**Workaround (until fix is implemented):** Scale the controller to 0, then patch the HTTPRoute path to `PathPrefix: /`:
+**Status:** PR open, awaiting review. Until merged and released, use the custom controller image:
+`us-central1-docker.pkg.dev/ai-infra-lab-86222/kserve-dev/kserve-controller:path-match-type`
+
+**Config:**
+```json
+{
+  "enableGatewayApi": true,
+  "kserveIngressGateway": "kserve/kserve-ingress-gateway",
+  "disableHTTPRouteTimeout": true,
+  "pathMatchType": "PathPrefix"
+}
+```
+
+**Legacy workaround (without custom image):** Scale the controller to 0, then patch the HTTPRoute path to `PathPrefix: /`:
 ```bash
 kubectl scale deploy kserve-controller-manager -n kserve --replicas=0
 kubectl patch httproute <name> --type=json \
