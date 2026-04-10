@@ -24,9 +24,7 @@ Along the way, I discovered two incompatibilities between KServe v0.17 and GKE's
 - **Ingress:** GKE Gateway API (native load balancer), host-based routing via HTTPRoute.
 - **Model:** `distilbert-base-uncased-finetuned-sst-2-english` served by KServe's HuggingFace runtime.
 
-## Highlights
-
-### Upstream contributions
+## Upstream contributions
 
 Two incompatibilities between KServe v0.17 and GKE Gateway API, both fixed in a fork and upstreamed:
 
@@ -40,13 +38,29 @@ Two incompatibilities between KServe v0.17 and GKE Gateway API, both fixed in a 
 - **Fix:** added a `pathMatchType` config flag, `resolvePathMatch()` helper, updated all 9 call sites. 23 files changed across Go code, 11 Helm chart sources, configmaps, quick-install scripts, and OpenAPI/Python SDK artifacts. Same pattern as #5313.
 - Issue: [kserve/kserve#5319](https://github.com/kserve/kserve/issues/5319) · Docs PR: [kserve/website#646](https://github.com/kserve/website/pull/646) · Analysis: [httproute-regex-path-analysis.md](httproute-regex-path-analysis.md) · Test report: [path-match-type-test-report.md](path-match-type-test-report.md)
 
-### Key decisions
+## Key decisions
 
-- **Standard Mode + Gateway API over Knative** — no cold starts on multi-GB LLMs, no Istio sidecar overhead on expensive GPU nodes, native support for long-lived streaming connections. Full tradeoff analysis in [Why Standard Mode + Gateway API](#why-standard-mode--gateway-api-not-knative) below.
+- **Standard Mode + Gateway API over Knative** — no cold starts on multi-GB LLMs, no Istio sidecar overhead on expensive GPU nodes, native support for long-lived streaming connections.
 - **Canary via manual HTTPRoute weights, not `canaryTrafficPercent`** — the KServe field only works in Knative mode ([kserve/kserve#5335](https://github.com/kserve/kserve/issues/5335)). In Standard Mode I used weighted `backendRefs` and discovered the model-name-parity requirement the hard way (see the [Canary Deployments](#canary-deployments-weight-based-traffic-splitting) section).
 - **Self-healing install script** — `install.sh` handles GKE-managed CRD conflicts, `kserve` namespace creation, webhook-readiness timing, and CRD-propagation races on `ClusterStorageContainer`.
 
-### Outcomes
+### Why Standard Mode + Gateway API (not Knative)
+
+KServe supports two deployment modes. We chose **Standard Mode with Gateway API** over the default Knative/serverless mode for several reasons:
+
+| Concern                      | Knative (Serverless)                                                                            | Standard + Gateway API                                                  | Why it matters for LLMs                                                                                                                                    |
+| ---------------------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Cold starts**              | Scales to zero — first request waits for pod startup + model load (seconds to minutes for LLMs) | Pods stay warm, no cold-start latency                                   | LLMs are multi-GB; loading into GPU memory takes 30s–5min. Unacceptable for user-facing inference.                                                         |
+| **Sidecar overhead**         | Requires Istio sidecar injection — adds memory/CPU per pod, complicates networking              | No sidecars needed                                                      | GPU nodes are expensive — sidecar memory overhead competes with model memory.                                                                              |
+| **Long-running connections** | Designed for request/response; streaming and long inference calls can hit Knative timeouts      | Native support for long-lived connections (important for LLM streaming) | LLM token streaming (SSE/WebSocket) requires persistent connections that outlast Knative's request timeout model.                                          |
+| **Operational complexity**   | Must install and manage Knative Serving + Istio (or Kourier) + KServe                           | Just KServe + cert-manager — fewer moving parts                         | Fewer components to debug when GPU scheduling or model loading fails.                                                                                      |
+| **GPU resource efficiency**  | Scale-to-zero means losing expensive GPU allocation; scale-up means re-loading multi-GB models  | Persistent pods keep models in GPU memory                               | A single A100 costs ~$2/hr — reloading a 70B model on every scale-up wastes both time and money. Keeping the pod warm is cheaper than repeated cold loads. |
+
+**Tradeoff:** Knative mode has better built-in canary support (`canaryTrafficPercent` field works natively). In Standard Mode, canary rollouts require manual HTTPRoute `backendRefs` weight management or external tools (Argo Rollouts, Flagger). This is a known gap in KServe's Standard Mode feature parity.
+
+**Bottom line:** For LLM and large model serving on GKE, Standard Mode + Gateway API is the recommended path. The cold-start and sidecar penalties of Knative outweigh its convenience features for production inference workloads.
+
+## Outcomes
 
 - End-to-end inference verified through external ingress: `curl → GKE Gateway → DistilBERT → {"predictions": [1, 0]}`.
 - Canary rollout verified: 90/10 weighted traffic split across stable + canary backends, ~85/15 distribution observed over 100 requests.
@@ -90,22 +104,6 @@ bash cluster.sh delete
 | KServe version | v0.17.0 |
 | Deployment mode | Standard (warm pods, no Knative sidecars) |
 | Ingress | Gateway API |
-
-## Why Standard Mode + Gateway API (not Knative)
-
-KServe supports two deployment modes. We chose **Standard Mode with Gateway API** over the default Knative/serverless mode for several reasons:
-
-| Concern                      | Knative (Serverless)                                                                            | Standard + Gateway API                                                  | Why it matters for LLMs                                                                                                                                    |
-| ---------------------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Cold starts**              | Scales to zero — first request waits for pod startup + model load (seconds to minutes for LLMs) | Pods stay warm, no cold-start latency                                   | LLMs are multi-GB; loading into GPU memory takes 30s–5min. Unacceptable for user-facing inference.                                                         |
-| **Sidecar overhead**         | Requires Istio sidecar injection — adds memory/CPU per pod, complicates networking              | No sidecars needed                                                      | GPU nodes are expensive — sidecar memory overhead competes with model memory.                                                                              |
-| **Long-running connections** | Designed for request/response; streaming and long inference calls can hit Knative timeouts      | Native support for long-lived connections (important for LLM streaming) | LLM token streaming (SSE/WebSocket) requires persistent connections that outlast Knative's request timeout model.                                          |
-| **Operational complexity**   | Must install and manage Knative Serving + Istio (or Kourier) + KServe                           | Just KServe + cert-manager — fewer moving parts                         | Fewer components to debug when GPU scheduling or model loading fails.                                                                                      |
-| **GPU resource efficiency**  | Scale-to-zero means losing expensive GPU allocation; scale-up means re-loading multi-GB models  | Persistent pods keep models in GPU memory                               | A single A100 costs ~$2/hr — reloading a 70B model on every scale-up wastes both time and money. Keeping the pod warm is cheaper than repeated cold loads. |
-
-**Tradeoff:** Knative mode has better built-in canary support (`canaryTrafficPercent` field works natively). In Standard Mode, canary rollouts require manual HTTPRoute `backendRefs` weight management or external tools (Argo Rollouts, Flagger). This is a known gap in KServe's Standard Mode feature parity.
-
-**Bottom line:** For LLM and large model serving on GKE, Standard Mode + Gateway API is the recommended path. The cold-start and sidecar penalties of Knative outweigh its convenience features for production inference workloads.
 
 ## Sending an Inference Request
 
@@ -343,7 +341,7 @@ Do **not** use dict-style payloads like `{"instances": [{"text": "hello"}]}` —
 
 **Symptom:** HTTPRoute `Accepted: False` with reason `UnsupportedValue`. InferenceService stays `IngressReady: False`. No external URL is assigned.
 
-**Fix:** Set `disableHTTPRouteTimeout: true` in the `inferenceservice-config` ConfigMap. Requires the custom controller image until the next KServe release includes the merged PR. Full context, root cause, and upstream PR details are in [Highlights → Upstream contributions](#upstream-contributions).
+**Fix:** Set `disableHTTPRouteTimeout: true` in the `inferenceservice-config` ConfigMap. Requires the custom controller image until the next KServe release includes the merged PR. Full context, root cause, and upstream PR details are in [Upstream contributions](#upstream-contributions).
 
 **Config:**
 ```json
@@ -354,13 +352,13 @@ Do **not** use dict-style payloads like `{"instances": [{"text": "hello"}]}` —
 }
 ```
 
-**Custom image:** build the KServe controller from the fork (see [Highlights → Upstream contributions](#upstream-contributions)) and push to your own registry, then set the controller image in the `kserve-controller-manager` Deployment.
+**Custom image:** build the KServe controller from the fork (see [Upstream contributions](#upstream-contributions)) and push to your own registry, then set the controller image in the `kserve-controller-manager` Deployment.
 
 ### 9. GKE Gateway rejects KServe HTTPRoute regex path (fixed in fork)
 
 **Symptom:** HTTPRoute `Accepted: False` with `GWCER104: Paths must start with a '/' character "^/.*$"`.
 
-**Fix:** Set `pathMatchType: "PathPrefix"` in the `inferenceservice-config` ConfigMap. Requires the custom controller image until the upstream PR is merged and released. Full context, root cause, and upstream PR details are in [Highlights → Upstream contributions](#upstream-contributions).
+**Fix:** Set `pathMatchType: "PathPrefix"` in the `inferenceservice-config` ConfigMap. Requires the custom controller image until the upstream PR is merged and released. Full context, root cause, and upstream PR details are in [Upstream contributions](#upstream-contributions).
 
 **Config:**
 ```json
@@ -372,7 +370,7 @@ Do **not** use dict-style payloads like `{"instances": [{"text": "hello"}]}` —
 }
 ```
 
-**Custom image:** build the KServe controller from the fork (see [Highlights → Upstream contributions](#upstream-contributions)) and push to your own registry, then set the controller image in the `kserve-controller-manager` Deployment.
+**Custom image:** build the KServe controller from the fork (see [Upstream contributions](#upstream-contributions)) and push to your own registry, then set the controller image in the `kserve-controller-manager` Deployment.
 
 **Legacy workaround (without custom image):** Scale the controller to 0, then patch the HTTPRoute path to `PathPrefix: /`:
 ```bash
