@@ -1,6 +1,58 @@
 # KServe on GKE
 
-Automated setup for running KServe on Google Kubernetes Engine, covering model serving, REST inference, and canary deployments.
+A hands-on study of production LLM/ML serving on Google Kubernetes Engine. This project runs a real inference workload (DistilBERT SST-2 sentiment classifier) on GKE using KServe's Standard Mode with Gateway API, exposed through a native GKE load balancer, with canary rollouts — all without Knative or Istio.
+
+Along the way, I discovered two incompatibilities between KServe v0.17 and GKE's Gateway API controller, fixed both in a fork, and upstreamed the fixes as pull requests.
+
+## Architecture
+
+```
+┌──────────┐    HTTPS     ┌────────────────┐   HTTPRoute    ┌────────────────────┐
+│  Client  │─────────────▶│  GKE Gateway   │───────────────▶│  KServe Predictor  │
+└──────────┘              │  (Gateway API) │   host-based   │  (DistilBERT pod)  │
+                          └────────────────┘     routing    └────────────────────┘
+                                                                      │
+                                                                      ▼
+                                                            ┌────────────────────┐
+                                                            │  HuggingFace model │
+                                                            │  (SST-2 fine-tuned)│
+                                                            └────────────────────┘
+```
+
+- **Cluster:** GKE Standard, 3× `e2-standard-4` nodes, Gateway API enabled.
+- **Control plane:** KServe v0.17.0 in Standard Mode (no Knative, no Istio).
+- **Ingress:** GKE Gateway API (native load balancer), host-based routing via HTTPRoute.
+- **Model:** `distilbert-base-uncased-finetuned-sst-2-english` served by KServe's HuggingFace runtime.
+
+## Highlights
+
+### Upstream contributions
+
+Two incompatibilities between KServe v0.17 and GKE Gateway API, both fixed in a fork and upstreamed:
+
+**1. HTTPRoute timeout field rejected by GKE Gateway** — [kserve/kserve#5313 (merged)](https://github.com/kserve/kserve/pull/5313)
+- KServe hardcoded `timeouts: {request: 60s}` on every HTTPRoute. GKE's Gateway controller does not implement `spec.rules.timeouts` and rejected the route with `UnsupportedValue`. Manual patches were reverted by the reconciler loop.
+- **Fix:** added a `DisableHTTPRouteTimeout` config flag to `IngressConfig`, introduced a `resolveTimeout()` helper, and updated all 9 timeout blocks in `httproute_reconciler.go`. New unit tests added. Default behavior unchanged.
+- Issue: [kserve/kserve#5311](https://github.com/kserve/kserve/issues/5311) · Analysis: [httproute-timeout-analysis.md](httproute-timeout-analysis.md) · Test report: [disable-httproute-timeout-test-report.md](disable-httproute-timeout-test-report.md)
+
+**2. HTTPRoute regex path match rejected by GKE Gateway** — [kserve/kserve#5347 (open)](https://github.com/kserve/kserve/pull/5347)
+- KServe's `createHTTPRouteMatch()` hardcoded `PathMatchRegularExpression` with pattern `^/.*$` (9 call sites). GKE Gateway only supports regex at Extended conformance and rejected the route with `GWCER104`. The dominant pattern is functionally equivalent to `PathPrefix: /`.
+- **Fix:** added a `pathMatchType` config flag, `resolvePathMatch()` helper, updated all 9 call sites. 23 files changed across Go code, 11 Helm chart sources, configmaps, quick-install scripts, and OpenAPI/Python SDK artifacts. Same pattern as #5313.
+- Issue: [kserve/kserve#5319](https://github.com/kserve/kserve/issues/5319) · Docs PR: [kserve/website#646](https://github.com/kserve/website/pull/646) · Analysis: [httproute-regex-path-analysis.md](httproute-regex-path-analysis.md) · Test report: [path-match-type-test-report.md](path-match-type-test-report.md)
+
+### Key decisions
+
+- **Standard Mode + Gateway API over Knative** — no cold starts on multi-GB LLMs, no Istio sidecar overhead on expensive GPU nodes, native support for long-lived streaming connections. Full tradeoff analysis in [Why Standard Mode + Gateway API](#why-standard-mode--gateway-api-not-knative) below.
+- **Canary via manual HTTPRoute weights, not `canaryTrafficPercent`** — the KServe field only works in Knative mode ([kserve/kserve#5335](https://github.com/kserve/kserve/issues/5335)). In Standard Mode I used weighted `backendRefs` and discovered the model-name-parity requirement the hard way (see the [Canary Deployments](#canary-deployments-weight-based-traffic-splitting) section).
+- **Self-healing install script** — `install.sh` handles GKE-managed CRD conflicts, `kserve` namespace creation, webhook-readiness timing, and CRD-propagation races on `ClusterStorageContainer`.
+
+### Outcomes
+
+- End-to-end inference verified through external ingress: `curl → GKE Gateway → DistilBERT → {"predictions": [1, 0]}`.
+- Canary rollout verified: 90/10 weighted traffic split across stable + canary backends, ~85/15 distribution observed over 100 requests.
+- 2 upstream issues filed, 2 PRs opened (1 merged, 1 under review), 1 docs PR opened.
+
+---
 
 ## Session Workflow
 
@@ -32,7 +84,6 @@ bash cluster.sh delete
 | Field | Value |
 |---|---|
 | Cluster name | `kserve-study` |
-| Project | `ai-infra-lab-86222` |
 | Zone | `us-central1-a` |
 | Nodes | 3x `e2-standard-4` (4 vCPU, 16 GB RAM each) |
 | GKE version | 1.35 |
@@ -288,23 +339,11 @@ Do **not** use dict-style payloads like `{"instances": [{"text": "hello"}]}` —
 
 **Fix:** Use `--task=sequence_classification` (not `text-classification`) in the InferenceService args.
 
-### 8. GKE Gateway rejects KServe HTTPRoutes with timeouts (fixed)
-
-**Problem:** KServe v0.17.0 hardcodes `timeouts: {request: 60s}` on every HTTPRoute it creates (`httproute_reconciler.go`). GKE's Gateway controller does not implement `spec.rules.timeouts`, so it rejects the route with `Accepted: False` / `UnsupportedValue`. There is no existing config flag to disable this, and manually patching the HTTPRoute is reverted by the reconciler loop.
+### 8. GKE Gateway rejects KServe HTTPRoutes with timeouts (fixed upstream)
 
 **Symptom:** HTTPRoute `Accepted: False` with reason `UnsupportedValue`. InferenceService stays `IngressReady: False`. No external URL is assigned.
 
-**Root cause analysis:** [httproute-timeout-analysis.md](httproute-timeout-analysis.md)
-
-**Fix:** We implemented a `DisableHTTPRouteTimeout` config flag in a fork of KServe. When set to `true` in the `inferenceservice-config` ConfigMap, the controller omits the `Timeouts` field from HTTPRoutes entirely. Default behavior is unchanged.
-
-- **Upstream PR:** https://github.com/kserve/kserve/pull/5313
-- **Upstream issue:** https://github.com/kserve/kserve/issues/5311
-- **Test report:** [disable-httproute-timeout-test-report.md](disable-httproute-timeout-test-report.md)
-- **Fork:** https://github.com/sophieliu15/kserve (branch: `fix/disable-httproute-timeout`)
-
-**Status:** PR merged upstream. Until the next KServe release includes it, use the custom controller image:
-`us-central1-docker.pkg.dev/ai-infra-lab-86222/kserve-dev/kserve-controller:disable-timeout`
+**Fix:** Set `disableHTTPRouteTimeout: true` in the `inferenceservice-config` ConfigMap. Requires the custom controller image until the next KServe release includes the merged PR. Full context, root cause, and upstream PR details are in [Highlights → Upstream contributions](#upstream-contributions).
 
 **Config:**
 ```json
@@ -315,26 +354,13 @@ Do **not** use dict-style payloads like `{"instances": [{"text": "hello"}]}` —
 }
 ```
 
-### 9. GKE Gateway rejects KServe HTTPRoute regex path (fixed)
+**Custom image:** build the KServe controller from the fork (see [Highlights → Upstream contributions](#upstream-contributions)) and push to your own registry, then set the controller image in the `kserve-controller-manager` Deployment.
 
-**Problem:** KServe uses `RegularExpression` path match type with pattern `^/.*$` on HTTPRoutes. GKE Gateway does not support `RegularExpression` (it is "Extended" conformance in the Gateway API spec) and rejects the route.
+### 9. GKE Gateway rejects KServe HTTPRoute regex path (fixed in fork)
 
 **Symptom:** HTTPRoute `Accepted: False` with `GWCER104: Paths must start with a '/' character "^/.*$"`.
 
-**Root cause:** `createHTTPRouteMatch()` in `httproute_reconciler.go` hardcodes `PathMatchRegularExpression`. Called 9 times across the reconciler. The dominant pattern `^/.*$` (FallbackPrefix, 6 of 9 sites) is functionally equivalent to `PathPrefix: /`.
-
-**Root cause analysis:** [httproute-regex-path-analysis.md](httproute-regex-path-analysis.md)
-
-**Fix:** We implemented a `pathMatchType` config flag in a fork of KServe. When set to `"PathPrefix"` in the `inferenceservice-config` ConfigMap, the reconciler uses `PathMatchPathPrefix` with equivalent prefix paths. Same pattern as the timeout fix (#8). Default behavior is unchanged.
-
-- **Upstream PR:** https://github.com/kserve/kserve/pull/5347
-- **Upstream issue:** https://github.com/kserve/kserve/issues/5319
-- **Docs PR:** https://github.com/kserve/website/pull/646
-- **Test report:** [path-match-type-test-report.md](path-match-type-test-report.md)
-- **Fork:** https://github.com/sophieliu15/kserve (branch: `fix/path-match-type`)
-
-**Status:** PR open, awaiting review. Until merged and released, use the custom controller image:
-`us-central1-docker.pkg.dev/ai-infra-lab-86222/kserve-dev/kserve-controller:path-match-type`
+**Fix:** Set `pathMatchType: "PathPrefix"` in the `inferenceservice-config` ConfigMap. Requires the custom controller image until the upstream PR is merged and released. Full context, root cause, and upstream PR details are in [Highlights → Upstream contributions](#upstream-contributions).
 
 **Config:**
 ```json
@@ -345,6 +371,8 @@ Do **not** use dict-style payloads like `{"instances": [{"text": "hello"}]}` —
   "pathMatchType": "PathPrefix"
 }
 ```
+
+**Custom image:** build the KServe controller from the fork (see [Highlights → Upstream contributions](#upstream-contributions)) and push to your own registry, then set the controller image in the `kserve-controller-manager` Deployment.
 
 **Legacy workaround (without custom image):** Scale the controller to 0, then patch the HTTPRoute path to `PathPrefix: /`:
 ```bash
