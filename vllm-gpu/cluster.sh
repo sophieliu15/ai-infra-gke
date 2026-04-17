@@ -1,32 +1,69 @@
 #!/usr/bin/env bash
 # GKE cluster for vLLM + GPU Week 5-8 hands-on (Phase 2).
 #
-# Cost while running:
-#   - Default CPU pool: ~$0.13/hr (1x e2-standard-4). Single node — no HA,
-#     but this cluster is recreated every session so HA is irrelevant.
-#   - GPU pool: ~$0.35/hr per T4 node (on-demand). Autoscales 0-1; a T4 only
-#     provisions when a pod requesting nvidia.com/gpu with a matching
-#     toleration is scheduled.
+# Region: us-west1 (Oregon). Picked over us-central1 after us-central1-a
+# repeatedly returned `FailedScaleUp: GCE out of resources` for on-demand
+# T4s on 2026-04-16 — us-central1 is Google's ML hub and is consistently
+# contested for older GPU SKUs.
 #
-# Delete the cluster at the end of each session to avoid creep — even with
-# the GPU pool at 0, the default pool keeps billing.
+# Cost while running (one GPU node at a time — global T4 quota = 1):
+#   - Default CPU pool:  ~$0.13/hr (1x e2-standard-4)
+#   - On-demand T4 pool: ~$0.35/hr per node (no preemption)
+#   - Spot T4 pool:      ~$0.10/hr per node (~30s preempt notice)
+#
+# Stockout resilience: both GPU pools span 3 zones (us-west1-b/c/a) with
+# --location-policy=ANY. Cluster autoscaler tries the preferred zone first
+# and falls through to other zones on FailedScaleUp. GKE also prefers the
+# non-Spot pool when both pools can satisfy a pending pod, so Spot only
+# takes traffic if on-demand is out across all zones.
+#
+# Always delete the cluster at session end — default pool keeps billing
+# even when both GPU pools are idle at 0 nodes.
 
 set -euo pipefail
 
 PROJECT_ID="ai-infra-lab-86222"
 CLUSTER_NAME="vllm-gpu-study"
-ZONE="us-central1-a"
+ZONE="us-west1-b"
+# Multi-zone locations for GPU pools. us-west1-b listed first as the
+# preferred zone; autoscaler falls through to c, then a on stockout.
+GPU_NODE_LOCATIONS="us-west1-b,us-west1-c,us-west1-a"
 
-# Default CPU pool (system workloads, Gateway API controller, KServe control plane).
 DEFAULT_MACHINE_TYPE="e2-standard-4"
 DEFAULT_NUM_NODES=1
 
-# GPU pool (quota-capped at 1 T4 as of 2026-04-13 — see Phase 2 Plan).
-GPU_POOL_NAME="gpu-pool"
 GPU_MACHINE_TYPE="n1-standard-4"
 GPU_TYPE="nvidia-tesla-t4"
 GPU_COUNT=1
 GPU_TAINT="nvidia.com/gpu=present:NoSchedule"
+
+ONDEMAND_POOL="gpu-pool-ondemand"
+SPOT_POOL="gpu-pool-spot"
+
+# $1=pool name, $2=capacity label value (ondemand|spot), $3=extra flags (e.g. "--spot" or "")
+create_gpu_pool() {
+  local pool_name="$1"
+  local capacity="$2"
+  local extra="$3"
+  echo "Adding GPU pool ${pool_name} (${capacity}, zones: ${GPU_NODE_LOCATIONS})..."
+  # shellcheck disable=SC2086
+  gcloud container node-pools create "${pool_name}" \
+    --cluster="${CLUSTER_NAME}" \
+    --project="${PROJECT_ID}" \
+    --zone="${ZONE}" \
+    --node-locations="${GPU_NODE_LOCATIONS}" \
+    --machine-type="${GPU_MACHINE_TYPE}" \
+    --accelerator="type=${GPU_TYPE},count=${GPU_COUNT},gpu-driver-version=default" \
+    --enable-autoscaling \
+    --location-policy=ANY \
+    --num-nodes=0 \
+    --total-min-nodes=0 \
+    --total-max-nodes=1 \
+    --node-taints="${GPU_TAINT}" \
+    --node-labels="gpu=t4,capacity=${capacity}" \
+    ${extra} \
+    --quiet
+}
 
 create() {
   echo "Creating cluster ${CLUSTER_NAME} in ${ZONE}..."
@@ -40,20 +77,8 @@ create() {
     --no-enable-basic-auth \
     --quiet
 
-  echo "Adding GPU node pool ${GPU_POOL_NAME} (autoscaling 0-1, driver auto-install)..."
-  gcloud container node-pools create "${GPU_POOL_NAME}" \
-    --cluster="${CLUSTER_NAME}" \
-    --project="${PROJECT_ID}" \
-    --zone="${ZONE}" \
-    --machine-type="${GPU_MACHINE_TYPE}" \
-    --accelerator="type=${GPU_TYPE},count=${GPU_COUNT},gpu-driver-version=default" \
-    --enable-autoscaling \
-    --num-nodes=0 \
-    --min-nodes=0 \
-    --max-nodes=1 \
-    --node-taints="${GPU_TAINT}" \
-    --node-labels="gpu=t4" \
-    --quiet
+  create_gpu_pool "${ONDEMAND_POOL}" "ondemand" ""
+  create_gpu_pool "${SPOT_POOL}"     "spot"     "--spot"
 
   echo "Fetching credentials..."
   gcloud container clusters get-credentials "${CLUSTER_NAME}" \
@@ -64,8 +89,10 @@ create() {
   echo "Cluster ready. kubectl context set."
   kubectl get nodes
   echo
-  echo "GPU pool starts at 0 nodes. A T4 provisions only when a pod requests"
-  echo "nvidia.com/gpu with toleration matching '${GPU_TAINT}'."
+  echo "Both GPU pools idle at 0 nodes. A T4 provisions only when a pod requests"
+  echo "nvidia.com/gpu with toleration matching '${GPU_TAINT}'. Autoscaler"
+  echo "prefers on-demand over Spot and us-west1-b over other zones; falls"
+  echo "through on 'GCE out of resources'."
 }
 
 delete() {
@@ -78,10 +105,12 @@ delete() {
 }
 
 status() {
-  echo "Nodes (by pool + accelerator):"
+  echo "Nodes (by pool + accelerator + spot + zone):"
   kubectl get nodes \
     -L cloud.google.com/gke-nodepool \
-    -L cloud.google.com/gke-accelerator
+    -L cloud.google.com/gke-accelerator \
+    -L cloud.google.com/gke-spot \
+    -L topology.kubernetes.io/zone
   echo
   local gpu_count
   gpu_count=$(kubectl get nodes -l cloud.google.com/gke-accelerator -o name 2>/dev/null | wc -l | tr -d ' ')
