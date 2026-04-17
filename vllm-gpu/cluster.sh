@@ -13,9 +13,13 @@
 #
 # Stockout resilience: both GPU pools span 3 zones (us-west1-b/c/a) with
 # --location-policy=ANY. Cluster autoscaler tries the preferred zone first
-# and falls through to other zones on FailedScaleUp. GKE also prefers the
-# non-Spot pool when both pools can satisfy a pending pod, so Spot only
-# takes traffic if on-demand is out across all zones.
+# and falls through to other zones on FailedScaleUp.
+#
+# On-demand-first priority: GKE's cluster autoscaler picks the cheapest
+# pool (Spot) by default. To enforce "on-demand first, Spot fallback,"
+# `cluster.sh create` applies a Custom Compute Class (compute-class.yaml)
+# that lists gpu-pool-ondemand before gpu-pool-spot. Pods opt in via
+# `nodeSelector: cloud.google.com/compute-class: gpu-t4`.
 #
 # Always delete the cluster at session end — default pool keeps billing
 # even when both GPU pools are idle at 0 nodes.
@@ -85,14 +89,17 @@ create() {
     --project="${PROJECT_ID}" \
     --zone="${ZONE}"
 
+  echo "Applying ComputeClass gpu-t4 (on-demand first, Spot fallback)..."
+  kubectl apply -f "$(dirname "$0")/compute-class.yaml"
+
   echo
   echo "Cluster ready. kubectl context set."
   kubectl get nodes
   echo
-  echo "Both GPU pools idle at 0 nodes. A T4 provisions only when a pod requests"
-  echo "nvidia.com/gpu with toleration matching '${GPU_TAINT}'. Autoscaler"
-  echo "prefers on-demand over Spot and us-west1-b over other zones; falls"
-  echo "through on 'GCE out of resources'."
+  echo "Both GPU pools idle at 0 nodes. A T4 provisions only when a pod"
+  echo "selects compute-class gpu-t4 and requests nvidia.com/gpu. On-demand"
+  echo "is tried first; Spot is used only on FailedScaleUp of on-demand."
+  echo "Zone failover within each pool is automatic (--location-policy=ANY)."
 }
 
 delete() {

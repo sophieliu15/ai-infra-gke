@@ -6,6 +6,8 @@ metadata:
     app: gpu-smoketest
 spec:
   restartPolicy: Never
+  nodeSelector:
+    cloud.google.com/compute-class: gpu-t4
   tolerations:
     - key: nvidia.com/gpu
       operator: Exists

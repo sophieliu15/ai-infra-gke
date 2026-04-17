@@ -1,0 +1,19 @@
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: gpu-t4
+spec:
+  # Autoscaler walks this list top-to-bottom on FailedScaleUp, so on-demand
+  # is tried first and Spot is used only when on-demand is stocked out.
+  # Without this, GKE's default "cheapest-first" expander would pick Spot
+  # whenever both pools have capacity.
+  priorities:
+    - nodepools: [gpu-pool-ondemand]
+    - nodepools: [gpu-pool-spot]
+  # Both referenced pools exist (created by cluster.sh); don't let CCC
+  # auto-provision additional ones.
+  nodePoolAutoCreation:
+    enabled: false
+  # If neither pool can scale up (both stocked out / quota hit), leave the
+  # pod Pending instead of placing it on an unrelated pool.
+  whenUnsatisfiable: DoNotScaleUp
