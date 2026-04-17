@@ -3,8 +3,12 @@ kserve/*.md
 !kserve/README.md
 !kserve/httproute-timeout-analysis.md
 !kserve/disable-httproute-timeout-test-report.md
+!kserve/path-match-type-test-report.md
 !kserve/httproute-regex-path-analysis.md
 !kserve/canary-traffic-split-troubleshooting.md
+
+# Local tooling
+.claude/
 
 # Credentials and secrets
 *.json
