@@ -1,6 +1,6 @@
 # vLLM + GPU Scheduling on GKE
 
-Deploy an open-weights LLM (`Qwen/Qwen3-4B-Instruct-2507`) on a GKE GPU node via vLLM, exposed through an OpenAI-compatible API. The cluster uses a two-pool GPU setup (on-demand + Spot) with multi-zone failover and a Custom Compute Class for on-demand-first scheduling priority. A follow-up iteration fronts vLLM with a KServe `InferenceService` to compose the serving stack from the [`kserve/`](../kserve/) project.
+Deploy an open-weights LLM (`Qwen/Qwen3-4B-Instruct-2507`) on a GKE GPU node via vLLM, exposed through an OpenAI-compatible API. The cluster uses a two-pool GPU setup (on-demand + Spot) with multi-zone failover and a Custom Compute Class for on-demand-first scheduling priority.
 
 ## Architecture
 
