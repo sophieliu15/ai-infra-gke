@@ -21,11 +21,11 @@ See [`kserve/README.md`](kserve/README.md) for architecture, design decisions, s
 
 ### [`vllm-gpu/`](vllm-gpu/)
 
-vLLM on GKE with NVIDIA T4 — self-hosted LLM serving on provisioned GPU hardware with an OpenAI-compatible API.
+vLLM on GKE with NVIDIA L4 — self-hosted LLM serving on provisioned GPU hardware with an OpenAI-compatible API.
 
-- Automated cluster create/delete/status script with T4 GPU pool autoscaling 0–1 and managed driver install (`gpu-driver-version=default`)
+- Automated cluster create/delete/status script with L4 GPU pool autoscaling 0–1 and managed driver install (`gpu-driver-version=default`)
 - GPU isolation via the taint + toleration + resource request pattern; decision documented with the three-lever mental model
-- Planned: `microsoft/phi-2` served via vLLM, throughput/TTFT benchmark across `--max-num-seqs` settings, GPU-accelerated PyTorch training Job, and a KServe + vLLM composition that fronts vLLM with an `InferenceService` from [`kserve/`](kserve/)
+- Planned: `Qwen/Qwen3-4B-Instruct-2507` served via vLLM, throughput/TTFT benchmark across `--max-num-seqs` settings, an offline batch-inference Kubernetes Job contending for the same single GPU, and a KServe + vLLM composition that fronts vLLM with an `InferenceService` from [`kserve/`](kserve/)
 - **Status:** in progress — scaffold and design decisions in place; deployment manifests and benchmarks to land next
 
 See [`vllm-gpu/README.md`](vllm-gpu/README.md) for architecture, design decisions, and setup instructions.

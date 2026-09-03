@@ -6,10 +6,24 @@
 # T4s on 2026-04-16 — us-central1 is Google's ML hub and is consistently
 # contested for older GPU SKUs.
 #
-# Cost while running (one GPU node at a time — global T4 quota = 1):
+# GPU: NVIDIA L4 on g2-standard-4 (migrated from T4/n1-standard-4 on
+# 2026-09-03). Three reasons, all pointing the same way:
+#   1. T4 has a published GCP end-of-support date of 2027-08-01.
+#   2. vLLM's Turing (sm_75) support is decaying — FlashInfer was dropped
+#      from SM75 backends in v0.24.0 and newer model families ship with no
+#      SM75 kernels at all.
+#   3. T4 is fp16-only. The current crop of small open models is bf16-native
+#      (Gemma 3 overflows to NaN in fp16), so a T4 quietly disqualifies most
+#      of them. L4 is Ada (sm_89) and supports bf16.
+# Bonus: L4 is offered in all three us-west1 zones; T4 is only in -a and -b,
+# so the three-zone failover design below never actually worked on T4.
+#
+# Cost while running (one GPU node at a time — global GPU quota = 1):
 #   - Default CPU pool:  ~$0.13/hr (1x e2-standard-4)
-#   - On-demand T4 pool: ~$0.35/hr per node (no preemption)
-#   - Spot T4 pool:      ~$0.10/hr per node (~30s preempt notice)
+#   - On-demand L4 pool: ~$0.70/hr per node (no preemption)
+#   - Spot L4 pool:      ~$0.22/hr per node (~30s preempt notice)
+#   All figures approximate; check current us-west1 pricing before relying
+#   on them for a budget estimate.
 #
 # Stockout resilience: both GPU pools span 3 zones (us-west1-b/c/a) with
 # --location-policy=ANY. Cluster autoscaler tries the preferred zone first
@@ -19,7 +33,7 @@
 # pool (Spot) by default. To enforce "on-demand first, Spot fallback,"
 # `cluster.sh create` applies a Custom Compute Class (compute-class.yaml)
 # that lists gpu-pool-ondemand before gpu-pool-spot. Pods opt in via
-# `nodeSelector: cloud.google.com/compute-class: gpu-t4`.
+# `nodeSelector: cloud.google.com/compute-class: gpu-l4`.
 #
 # Always delete the cluster at session end — default pool keeps billing
 # even when both GPU pools are idle at 0 nodes.
@@ -36,8 +50,10 @@ GPU_NODE_LOCATIONS="us-west1-b,us-west1-c,us-west1-a"
 DEFAULT_MACHINE_TYPE="e2-standard-4"
 DEFAULT_NUM_NODES=1
 
-GPU_MACHINE_TYPE="n1-standard-4"
-GPU_TYPE="nvidia-tesla-t4"
+# G2 is a GPU-attached machine family: g2-standard-4 ships with exactly one
+# L4. The --accelerator flag is still required so GKE installs the driver.
+GPU_MACHINE_TYPE="g2-standard-4"
+GPU_TYPE="nvidia-l4"
 GPU_COUNT=1
 GPU_TAINT="nvidia.com/gpu=present:NoSchedule"
 
@@ -64,7 +80,7 @@ create_gpu_pool() {
     --total-min-nodes=0 \
     --total-max-nodes=1 \
     --node-taints="${GPU_TAINT}" \
-    --node-labels="gpu=t4,capacity=${capacity}" \
+    --node-labels="gpu=l4,capacity=${capacity}" \
     ${extra} \
     --quiet
 }
@@ -89,15 +105,15 @@ create() {
     --project="${PROJECT_ID}" \
     --zone="${ZONE}"
 
-  echo "Applying ComputeClass gpu-t4 (on-demand first, Spot fallback)..."
+  echo "Applying ComputeClass gpu-l4 (on-demand first, Spot fallback)..."
   kubectl apply -f "$(dirname "$0")/compute-class.yaml"
 
   echo
   echo "Cluster ready. kubectl context set."
   kubectl get nodes
   echo
-  echo "Both GPU pools idle at 0 nodes. A T4 provisions only when a pod"
-  echo "selects compute-class gpu-t4 and requests nvidia.com/gpu. On-demand"
+  echo "Both GPU pools idle at 0 nodes. An L4 provisions only when a pod"
+  echo "selects compute-class gpu-l4 and requests nvidia.com/gpu. On-demand"
   echo "is tried first; Spot is used only on FailedScaleUp of on-demand."
   echo "Zone failover within each pool is automatic (--location-policy=ANY)."
 }
