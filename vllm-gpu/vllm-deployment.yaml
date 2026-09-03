@@ -1,0 +1,121 @@
+# vLLM Deployment — Qwen3-4B on NVIDIA L4 (Phase 2, Week 6)
+#
+# Image pinned to v0.28.0 (released 2026-08-26). Do not use `latest`.
+# Model: Qwen/Qwen3-4B-Instruct-2507 (~8 GB bf16 weights on a 24 GB L4).
+#
+# --max-model-len=16384 is MANDATORY — the model's config declares 262144,
+# which would need ~37 GB of KV cache for a single sequence and OOM on load.
+# At 16384, the KV budget supports ~5 full-length concurrent sequences.
+#
+# Sizing reference: Study Notes/9. vLLM Deployment on Kubernetes.md
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vllm-gpu
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: vllm-gpu
+  labels:
+    app: vllm
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      enableServiceLinks: false
+      # CCC routes to on-demand L4 first, Spot fallback on FailedScaleUp.
+      nodeSelector:
+        cloud.google.com/compute-class: gpu-l4
+      tolerations:
+        # GPU taint — applied by cluster.sh on both GPU pools.
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        # Spot taint — defence-in-depth; current GKE applies this as a
+        # label only, but keeping it forward-compatible.
+        - key: cloud.google.com/gke-spot
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.28.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - "Qwen/Qwen3-4B-Instruct-2507"
+            - "--max-model-len"
+            - "16384"
+            - "--gpu-memory-utilization"
+            - "0.9"
+            - "--dtype"
+            - "auto"
+            - "--enforce-eager"
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: VLLM_PORT
+              value: "8000"
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
+          # startupProbe: cold start = image pull (5-10 min on fresh node)
+          # + model download (~8 GB, 1-3 min) + CUDA graph capture.
+          # Budget: 120 × 10s = 20 min before giving up.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: 120
+            periodSeconds: 10
+          # readinessProbe: gates traffic until model is loaded and healthy.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+          # livenessProbe: restarts the pod if it wedges after startup.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: hf-cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm
+  namespace: vllm-gpu
+  labels:
+    app: vllm
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP

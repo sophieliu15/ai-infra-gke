@@ -80,7 +80,7 @@ create_gpu_pool() {
     --total-min-nodes=0 \
     --total-max-nodes=1 \
     --node-taints="${GPU_TAINT}" \
-    --node-labels="gpu=l4,capacity=${capacity}" \
+    --node-labels="cloud.google.com/compute-class=gpu-l4,gpu=l4,capacity=${capacity}" \
     ${extra} \
     --quiet
 }
