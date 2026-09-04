@@ -7,6 +7,9 @@ kserve/*.md
 !kserve/httproute-regex-path-analysis.md
 !kserve/canary-traffic-split-troubleshooting.md
 
+# Agent handoff plans — local working docs, not portfolio content
+vllm-gpu/kserve-vllm-bridge-plan.md
+
 # Local tooling
 .claude/
 
