@@ -1,0 +1,46 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vllm-gpu
+---
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: qwen3
+  namespace: vllm-gpu
+spec:
+  predictor:
+    minReplicas: 1
+    maxReplicas: 1
+    # Must match the ComputeClass + GPU taint, or the autoscaler never
+    # provisions an L4 and the pod sits Pending with no useful event.
+    nodeSelector:
+      cloud.google.com/compute-class: gpu-l4
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      - key: cloud.google.com/gke-spot
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+    model:
+      modelFormat:
+        name: vLLM
+      runtime: kserve-vllmserver     # pin explicitly, don't rely on autoSelect
+      runtimeVersion: v0.28.0        # overrides the runtime's stale v0.20.0 tag
+      storageUri: hf://Qwen/Qwen3-4B-Instruct-2507
+      args:
+        - --max-model-len=16384      # MANDATORY — config declares 262144
+        - --gpu-memory-utilization=0.9
+        - --dtype=auto
+        - --enforce-eager
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+          cpu: "3"
+          memory: 12Gi
+        requests:
+          cpu: "2"
+          memory: 8Gi

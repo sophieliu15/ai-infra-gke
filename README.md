@@ -25,8 +25,10 @@ vLLM on GKE with NVIDIA L4 — self-hosted LLM serving on provisioned GPU hardwa
 - Automated cluster create/delete/status script with two L4 GPU pools (on-demand + Spot) autoscaling 0–1 and managed driver install (`gpu-driver-version=default`)
 - On-demand-first scheduling priority using a GKE Custom Compute Class (`gpu-l4`) with automatic multi-zone failover
 - GPU isolation via the taint + toleration + resource request pattern
-- `Qwen/Qwen3-4B-Instruct-2507` served via vLLM v0.28.0 on NVIDIA L4 (24 GB VRAM)
-- OpenAI-compatible API (`/v1/chat/completions`) and Prometheus metrics scraping (`/metrics`)
-- Detailed troubleshooting log (ComputeClass labels, rollout strategies, engine timeouts, K8s service link env conflicts, max-model-len OOMs)
+- `Qwen/Qwen3-4B-Instruct-2507` served on NVIDIA L4 (24 GB VRAM) across two deployment modes:
+  - **Raw Kubernetes Deployment**: direct `vllm-openai:v0.28.0` container with emptyDir weight caching
+  - **KServe Platform Serving**: `InferenceService` (v1beta1) orchestrating vLLM via `kserve-vllmserver` and decoupled `storage-initializer`
+- Prometheus metrics scraping (`/metrics`)
+- Detailed troubleshooting log (ComputeClass labels, rollout strategies, `storage-initializer` 4Gi memory limits, runtime command patches, max-model-len OOMs)
 
 See [`vllm-gpu/README.md`](vllm-gpu/README.md) for setup instructions, architecture, and troubleshooting.

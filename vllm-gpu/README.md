@@ -67,7 +67,9 @@ kubectl delete -f gpu-smoketest.yaml
 
 This exercises four things that can fail silently on a fresh cluster: autoscaler scale-up, GPU driver install, taint/toleration match, and GPU device advertisement. If the pod stays `Pending`, check `kubectl describe pod gpu-smoketest` for autoscaler events.
 
-### 3. Deploy vLLM
+### 3. Deploy vLLM via Raw Deployment
+
+#### 3.1 Deploy the workload
 
 ```bash
 kubectl apply -f vllm-deployment.yaml
@@ -82,7 +84,7 @@ Wait for the pod to reach `Running 1/1`. On a cold node (first deploy), expect:
 
 Total cold start: **~6–10 minutes**. Subsequent deploys on the same node skip the image pull and reuse cached weights.
 
-### 4. Send a request
+#### 3.2 Send a request
 
 ```bash
 # Port-forward the vLLM service
@@ -115,13 +117,86 @@ Expected response:
 }
 ```
 
-### 5. Scrape Prometheus metrics
+#### 3.3 Scrape Prometheus metrics
 
 ```bash
 curl -s http://localhost:8000/metrics | grep -E "vllm:(num_requests|kv_cache|generation_tokens|time_to_first)"
 ```
 
-Key metrics:
+Scrapes directly from port `8000`. Metrics use label `model_name="Qwen/Qwen3-4B-Instruct-2507"`.
+
+---
+
+### 4. Deploy via KServe (InferenceService)
+
+> [!IMPORTANT]
+> **Single GPU Quota:** On a cluster with quota=1, ensure any raw vLLM deployment is scaled down (`kubectl scale deploy vllm -n vllm-gpu --replicas=0`) before creating the KServe predictor pod.
+
+#### 4.1 Install KServe and deploy the InferenceService
+
+```bash
+# 1. Install KServe v0.20.0 with refined GKE CRD filters and runtime patches
+bash kserve_install.sh
+
+# 2. Apply the InferenceService manifest
+kubectl apply -f qwen3-vllm-isvc.yaml
+
+# 3. Wait for Ready status (aggregates pod, initContainer, and networking readiness)
+kubectl get isvc qwen3 -n vllm-gpu -w
+```
+
+#### 4.2 Send a request
+
+```bash
+# Port-forward the KServe predictor service (service port 80 -> host 8080)
+kubectl port-forward svc/qwen3-predictor 8080:80 -n vllm-gpu &
+
+# Send a chat completion request
+# IMPORTANT: Model name is the InferenceService name ("qwen3"), NOT the Hugging Face repo ID.
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3",
+    "messages": [{"role": "user", "content": "Explain KV cache in one sentence."}],
+    "max_tokens": 60
+  }'
+```
+
+Expected response:
+```json
+{
+  "id": "chatcmpl-ae5916d4d9d70bda",
+  "model": "qwen3",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "A KV cache (Key-Value cache) stores previously computed key-value pairs from a model's attention mechanism to avoid redundant calculations and speed up subsequent token generation in sequence modeling."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {"prompt_tokens": 16, "completion_tokens": 36, "total_tokens": 52}
+}
+```
+
+#### 4.3 Scrape Prometheus metrics
+
+```bash
+curl -s http://localhost:8080/metrics | grep -E "vllm:(num_requests|kv_cache|generation_tokens|time_to_first)"
+```
+
+**Differences vs. Raw Deployment:**
+1. **Port & Service:** Scraped via `svc/qwen3-predictor` on port `8080` (mapped to target container port 8080), whereas raw deployment defaults to `8000`.
+2. **Model Label:** Metrics report `model_name="qwen3"` instead of `model_name="Qwen/Qwen3-4B-Instruct-2507"` because `kserve-vllmserver` sets `--served-model-name={{.Name}}`.
+3. **Telemetry Annotations:** KServe automatically injects `prometheus.kserve.io/port: "8080"` and `prometheus.kserve.io/path: /metrics` into the pod metadata for cluster-level scrapers.
+
+---
+
+### 5. Metric Reference
+
+Key metrics exposed by vLLM:
 
 | Metric | Type | What it measures |
 | --- | --- | --- |
@@ -313,6 +388,46 @@ L4: bf16-capable, 24 GB (vs 16 GB), FlashAttention-eligible, not on a sunset pat
 
 `us-west1` over `us-central1` — `us-central1` is Google's ML hub and is consistently contested for GPU inventory. `us-west1` has historically better on-demand availability. Same quota is pre-approved in every US region, so switching is a config change only.
 
+## KServe + vLLM Integration & Live Benchmark
+
+In addition to managing vLLM via a raw Kubernetes Deployment, the cluster was validated and benchmarked with **KServe v0.20.0** deploying `Qwen/Qwen3-4B-Instruct-2507` via an `InferenceService` (`serving.kserve.io/v1beta1`) and the new first-class `kserve-vllmserver` `ClusterServingRuntime`.
+
+### Architecture Comparison
+
+```
+Raw vLLM Deployment:
+Client ──▶ Service (:8000) ──▶ vLLM Pod (in-engine HF download to /root/.cache)
+
+KServe InferenceService:
+Client ──▶ Predictor Service (:80) ──▶ Pod [ storage-initializer (hf:// ──▶ /mnt/models)
+                                              kserve-container    (vLLM reads /mnt/models) ]
+```
+
+### Live Benchmark Results
+
+Full execution logs, CRD audits, and metrics: [`kserve-l4-deployment-test-report.md`](./kserve-l4-deployment-test-report.md).
+
+| Metric / Dimension | Raw vLLM Baseline | KServe Path A | Operational Impact |
+|---|---|---|---|
+| **Control Plane** | Raw `apps/v1` `Deployment` | `serving.kserve.io/v1beta1` `InferenceService` | Reusable declarative CRD; aggregated `Ready: True` status conditions |
+| **Model Ingestion** | In-engine download to `/root/.cache` inside container | Decoupled `storage-initializer` init container to `/mnt/models` | **Cold Start Caveat:** GPU node sits idle and billing during the ~68s initContainer download. |
+| **Served Model Name** | `Qwen/Qwen3-4B-Instruct-2507` | `qwen3` | Runtime binds `--served-model-name={{.Name}}`. Must target the ISVC resource name. |
+| **Avg TTFT** | `126.58 ms` | `115.68 ms` | Identical inference speed within normal variance |
+| **Tokens Generated** | 60 tokens | 92 tokens across 2 prompts | High-quality, deterministic output |
+| **VRAM Footprint** | ~8.9 GB | 8,938 MiB / 23,034 MiB | Identical memory allocation on NVIDIA L4 |
+
+### KServe Operational Discoveries & Fixes
+
+1. **`storage-initializer` OOMKill on Large Models (`Exit Code: 137`):**
+   - *Issue:* Upstream KServe v0.20.0 limits `storage-initializer` memory to `1Gi` in the `ClusterStorageContainer/default` CRD. Streaming the 7.49 GiB model via `hf_transfer` exceeded 1Gi of resident memory.
+   - *Fix:* Patched `clusterstoragecontainer/default` memory limit to `4Gi` (and request to `1Gi`). Download completed cleanly in **68.7 seconds**.
+2. **Runtime Command Mismatch (`exec: "python" not found`, `Exit Code: 128`):**
+   - *Issue:* Upstream `kserve-vllmserver` declares `command: [python, ...]`, but modern Debian/Ubuntu-based vLLM images only include `/usr/bin/python3`.
+   - *Fix:* Patched `clusterservingruntime/kserve-vllmserver` command entrypoint to `python3`.
+3. **Single GPU Quota Rollout Contention:**
+   - *Issue:* KServe's synthesized Deployment defaults to `RollingUpdate`, which attempts to schedule the new pod before terminating the old pod, deadlocking on a quota=1 cluster.
+   - *Fix:* Scale old ReplicaSets to 0 before rolling updates to instantly free the accelerator.
+
 ## Scripts
 
 | Script | What it does |
@@ -320,3 +435,4 @@ L4: bf16-capable, 24 GB (vs 16 GB), FlashAttention-eligible, not on a sunset pat
 | `cluster.sh create` | Creates the GKE cluster with two L4 GPU pools + ComputeClass |
 | `cluster.sh delete` | Deletes the cluster and stops all charges |
 | `cluster.sh status` | Shows nodes by pool, accelerator, spot, and zone labels |
+| `kserve_install.sh` | Installs KServe v0.20.0, cert-manager v1.17.0, with refined GKE CRD filters and runtime patches |
